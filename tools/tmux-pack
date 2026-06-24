@@ -5,7 +5,7 @@
 # 用法:
 #   tmux-pack [OUTDIR] [--name NAME] [--upgrade] [--proxy URL] [--no-tgz] [-h]
 #     OUTDIR        产物输出目录(位置参数),默认当前工作目录
-#     --name NAME   bundle 基名,默认 tmux-pack-<host>-<时间戳>
+#     --name NAME   bundle 基名,默认 tmux-config-sync-<时间戳>
 #     --upgrade     打包前对每个仓库 git pull --ff-only(需联网)
 #     --proxy URL   仅配合 --upgrade:显式把代理传给 git(覆盖环境变量)。
 #                   若已 export https_proxy/http_proxy,git 会自动继承,无需本项。
@@ -113,7 +113,7 @@ upgrade_repo() {
 # ---------- 准备工作目录 ----------
 TS=$(date +%Y%m%d-%H%M%S)
 HOSTN=$(hostname 2>/dev/null || echo host)
-[ -n "$NAME" ] || NAME="tmux-pack-${HOSTN}-${TS}"
+[ -n "$NAME" ] || NAME="tmux-config-sync-${TS}"
 TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/tmuxpack.XXXXXX")
 trap 'rm -rf "$TMPROOT"' EXIT INT TERM
 WORK="$TMPROOT/$NAME"
