@@ -1,0 +1,239 @@
+#!/bin/sh
+# tmux-pack — 把当前 tmux 环境(oh-my-tmux + 个性化配置 + 插件,不含 tmux 本体)
+#             打成一个离线即用的"懒人包"。纯 POSIX sh,Linux 发行版通用。
+#
+# 用法:
+#   tmux-pack [OUTDIR] [--name NAME] [--upgrade] [--proxy URL] [--no-tgz] [-h]
+#     OUTDIR        产物输出目录(位置参数),默认当前工作目录
+#     --name NAME   bundle 基名,默认 tmux-pack-<host>-<时间戳>
+#     --upgrade     打包前对每个仓库 git pull --ff-only(需联网)
+#     --proxy URL   仅配合 --upgrade:显式把代理传给 git(覆盖环境变量)。
+#                   若已 export https_proxy/http_proxy,git 会自动继承,无需本项。
+#     --no-tgz      只产目录,不再压成 .tar.gz
+#     -h, --help    显示帮助
+#
+# 仅支持 Linux(假设 GNU coreutils:readlink -f / cp -a)。
+# 无参数运行 = 显示本帮助;要打包到当前目录请显式 `tmux-pack .`。
+set -eu
+
+PROG=tmux-pack
+MANIFEST_VERSION=1
+
+# ---------- 参数解析 ----------
+OUTDIR=$PWD
+NAME=""
+DO_UPGRADE=0
+PROXY=""
+NO_TGZ=0
+
+usage() {
+  # 打印从第 2 行起、到 `set -eu` 之前的注释块(对增删注释行健壮)
+  sed -n '2,/^set -eu/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+}
+
+[ $# -eq 0 ] && { usage; exit 0; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --upgrade) DO_UPGRADE=1 ;;
+    --proxy) PROXY=${2:?--proxy 需要一个 URL}; shift ;;
+    --proxy=*) PROXY=${1#--proxy=} ;;
+    --name) NAME=${2:?--name 需要一个值}; shift ;;
+    --name=*) NAME=${1#--name=} ;;
+    --no-tgz) NO_TGZ=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) printf '%s: 未知参数: %s\n' "$PROG" "$1" >&2; exit 2 ;;
+    *) OUTDIR=$1 ;;
+  esac
+  shift
+done
+
+die() { printf '%s: 错误: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: 警告: %s\n' "$PROG" "$*" >&2; }
+
+# ---------- 能力探测 ----------
+command -v tar >/dev/null 2>&1 || die "缺少 tar"
+command -v readlink >/dev/null 2>&1 || die "缺少 readlink"
+readlink -f / >/dev/null 2>&1 || die "readlink 不支持 -f(需 GNU coreutils)"
+HAVE_GIT=0; command -v git >/dev/null 2>&1 && HAVE_GIT=1
+HAVE_GZIP=0; command -v gzip >/dev/null 2>&1 && HAVE_GZIP=1
+[ "$HAVE_GZIP" -eq 1 ] || { warn "缺少 gzip,改为只产目录(--no-tgz)"; NO_TGZ=1; }
+
+# ---------- 探测本机布局 ----------
+: "${HOME:?HOME 未设置}"
+XDG_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}
+CFG="$XDG_CONFIG/tmux"
+PLUGIN_ROOT=${TMUX_PLUGIN_MANAGER_PATH:-$HOME/.tmux/plugins}
+
+[ -d "$CFG" ] || die "未找到 tmux 配置目录: $CFG"
+
+# 定位 oh-my-tmux 仓库根(从 tmux.conf 软链目标向上找 .git)
+OMT_ROOT=""
+if [ -e "$CFG/tmux.conf" ]; then
+  t=$(readlink -f "$CFG/tmux.conf" 2>/dev/null || true)
+  d=$(dirname "$t" 2>/dev/null || true)
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -d "$d/.git" ]; then OMT_ROOT=$d; break; fi
+    d=$(dirname "$d")
+  done
+fi
+
+# ---------- 令牌化(绝对路径 -> @TOKEN@,保证跨 $HOME 可移植)----------
+tok() {
+  p=$1
+  case "$p" in
+    "$PLUGIN_ROOT") printf '@PLUGIN_ROOT@' ;;
+    "$PLUGIN_ROOT"/*) printf '@PLUGIN_ROOT@%s' "${p#"$PLUGIN_ROOT"}" ;;
+    "$CFG") printf '@XDG_CONFIG@/tmux' ;;
+    "$CFG"/*) printf '@XDG_CONFIG@/tmux%s' "${p#"$CFG"}" ;;
+    "$XDG_CONFIG") printf '@XDG_CONFIG@' ;;
+    "$XDG_CONFIG"/*) printf '@XDG_CONFIG@%s' "${p#"$XDG_CONFIG"}" ;;
+    "$HOME") printf '@HOME@' ;;
+    "$HOME"/*) printf '@HOME@%s' "${p#"$HOME"}" ;;
+    *) printf '%s' "$p" ;;
+  esac
+}
+
+# 取仓库版本信息
+repo_head() { [ "$HAVE_GIT" -eq 1 ] && git -C "$1" rev-parse --short HEAD 2>/dev/null || echo "-"; }
+repo_url()  { [ "$HAVE_GIT" -eq 1 ] && git -C "$1" config --get remote.origin.url 2>/dev/null || echo "-"; }
+
+# ---------- 可选升级 ----------
+upgrade_repo() {
+  d=$1
+  [ -d "$d/.git" ] || return 0
+  ( set +e
+    [ -n "$PROXY" ] && export https_proxy="$PROXY" http_proxy="$PROXY" ALL_PROXY="$PROXY"
+    git -C "$d" pull --ff-only >/dev/null 2>&1
+  ) && printf '  升级 %s -> %s\n' "$(basename "$d")" "$(repo_head "$d")" \
+    || warn "升级 $(basename "$d") 失败,保留当前版本"
+}
+
+# ---------- 准备工作目录 ----------
+TS=$(date +%Y%m%d-%H%M%S)
+HOSTN=$(hostname 2>/dev/null || echo host)
+[ -n "$NAME" ] || NAME="tmux-pack-${HOSTN}-${TS}"
+TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/tmuxpack.XXXXXX")
+trap 'rm -rf "$TMPROOT"' EXIT INT TERM
+WORK="$TMPROOT/$NAME"
+mkdir -p "$WORK/payload/config" "$WORK/payload/plugins"
+
+# 定位自身与 tmux-restore(随包带上,使任何机器都能再打包)
+SELFDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ "$DO_UPGRADE" -eq 1 ]; then
+  [ "$HAVE_GIT" -eq 1 ] || die "--upgrade 需要 git"
+  printf '升级仓库中...\n'
+  [ -n "$OMT_ROOT" ] && upgrade_repo "$OMT_ROOT"
+  for d in "$PLUGIN_ROOT"/*/; do [ -d "$d" ] && upgrade_repo "${d%/}"; done
+fi
+
+# ---------- 复制配置(实体)----------
+cp -a "$CFG/." "$WORK/payload/config/" 2>/dev/null || die "复制配置失败"
+# 软链 tmux.conf 交给 manifest 重建,避免死链入包
+rm -f "$WORK/payload/config/tmux.conf"
+# 排除备份文件
+find "$WORK/payload/config" -name '*.bak-*' -exec rm -rf {} + 2>/dev/null || true
+
+# ---------- 复制 oh-my-tmux ----------
+if [ -n "$OMT_ROOT" ] && [ -d "$OMT_ROOT" ]; then
+  cp -a "$OMT_ROOT" "$WORK/payload/oh-my-tmux" || die "复制 oh-my-tmux 失败"
+else
+  warn "未找到 oh-my-tmux 仓库,跳过"
+fi
+
+# ---------- 复制插件 ----------
+PLUG_LIST=""
+if [ -d "$PLUGIN_ROOT" ]; then
+  for d in "$PLUGIN_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    bn=$(basename "$d")
+    cp -a "${d%/}" "$WORK/payload/plugins/$bn" || warn "复制插件 $bn 失败"
+    PLUG_LIST="$PLUG_LIST $bn"
+  done
+fi
+[ -n "$PLUG_LIST" ] || warn "插件目录为空: $PLUGIN_ROOT"
+
+# ---------- 生成 manifest ----------
+TAB=$(printf '\t')
+MF="$WORK/manifest"
+{
+  printf '#TMUX-PACK-MANIFEST v%s\n' "$MANIFEST_VERSION"
+  printf 'META%ssrc_host%s%s\n' "$TAB" "$TAB" "$HOSTN"
+  printf 'META%ssrc_home%s%s\n' "$TAB" "$TAB" "$HOME"
+  printf 'META%screated%s%s\n' "$TAB" "$TAB" "$TS"
+  printf 'META%stmux_version%s%s\n' "$TAB" "$TAB" "$(tmux -V 2>/dev/null || echo unknown)"
+  printf 'VAR%sPLUGIN_ROOT%s%s\n' "$TAB" "$TAB" "$(tok "$PLUGIN_ROOT")"
+  # 实体目录映射
+  printf 'DIR%spayload/config%s%s\n' "$TAB" "$TAB" "$(tok "$CFG")"
+  [ -d "$WORK/payload/oh-my-tmux" ] && printf 'DIR%spayload/oh-my-tmux%s%s\n' "$TAB" "$TAB" "$(tok "$OMT_ROOT")"
+  [ -n "$PLUG_LIST" ] && printf 'DIR%spayload/plugins%s%s\n' "$TAB" "$TAB" "$(tok "$PLUGIN_ROOT")"
+  # 软链(原始目标令牌化后保存)
+  for lnk in "$CFG/tmux.conf" "$HOME/.tmux.conf" "$HOME/.tmux.conf.local"; do
+    if [ -L "$lnk" ]; then
+      raw=$(readlink "$lnk")
+      case "$raw" in /*) tgt=$(tok "$raw") ;; *) tgt=$raw ;; esac
+      printf 'LINK%s%s%s%s\n' "$TAB" "$(tok "$lnk")" "$TAB" "$tgt"
+    fi
+  done
+  # 版本审计
+  [ -n "$OMT_ROOT" ] && printf 'REPO%soh-my-tmux%s%s%s%s\n' "$TAB" "$TAB" "$(repo_url "$OMT_ROOT")" "$TAB" "$(repo_head "$OMT_ROOT")"
+  for bn in $PLUG_LIST; do
+    printf 'REPO%s%s%s%s%s%s\n' "$TAB" "$bn" "$TAB" "$(repo_url "$PLUGIN_ROOT/$bn")" "$TAB" "$(repo_head "$PLUGIN_ROOT/$bn")"
+  done
+} > "$MF"
+
+# ---------- 随包带上脚本 ----------
+cp "$SELFDIR/tmux-pack" "$WORK/tmux-pack" 2>/dev/null || cp "$0" "$WORK/tmux-pack"
+if [ -f "$SELFDIR/tmux-restore" ]; then
+  cp "$SELFDIR/tmux-restore" "$WORK/tmux-restore"
+else
+  warn "同目录未找到 tmux-restore,包内将缺少恢复脚本"
+fi
+cat > "$WORK/restore.sh" <<'EOF'
+#!/bin/sh
+# 一键还原本 bundle:转发到同目录 tmux-restore
+d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$d/tmux-restore" "$d" "$@"
+EOF
+chmod +x "$WORK/tmux-pack" "$WORK/restore.sh" 2>/dev/null || true
+[ -f "$WORK/tmux-restore" ] && chmod +x "$WORK/tmux-restore" 2>/dev/null || true
+
+# ---------- 生成报告 ----------
+sz() { du -sh "$1" 2>/dev/null | cut -f1; }
+REPORT="$WORK/REPORT.txt"
+{
+  printf 'tmux 懒人包 已生成\n'
+  printf '=====================================\n'
+  printf '源机: %s   tmux: %s   $HOME=%s\n' "$HOSTN" "$(tmux -V 2>/dev/null || echo unknown)" "$HOME"
+  if [ "$DO_UPGRADE" -eq 1 ]; then printf '模式: 升级后打包 (--upgrade)\n'; else printf '模式: 离线快照 (未 --upgrade)\n'; fi
+  printf '\n组件:\n'
+  printf '  [配置] %s\n' "$(tok "$CFG")"
+  [ -d "$WORK/payload/oh-my-tmux" ] && printf '  [主题] oh-my-tmux  %s  %s  (%s)\n' "$(repo_head "$OMT_ROOT")" "$(repo_url "$OMT_ROOT")" "$(sz "$WORK/payload/oh-my-tmux")"
+  for bn in $PLUG_LIST; do
+    printf '  [插件] %-16s %s  (%s)\n' "$bn" "$(repo_head "$PLUGIN_ROOT/$bn")" "$(sz "$WORK/payload/plugins/$bn")"
+  done
+  printf '\n软链(目标机按其 $HOME 重建):\n'
+  for lnk in "$CFG/tmux.conf" "$HOME/.tmux.conf" "$HOME/.tmux.conf.local"; do
+    [ -L "$lnk" ] && printf '  %s -> %s\n' "$(tok "$lnk")" "$(readlink "$lnk")"
+  done
+  printf '\n已排除: resurrect 快照, *.bak-* 备份, tmux 本体\n'
+  printf '\n还原: 解压后执行  ./restore.sh   (或 tmux-restore <包路径>)\n'
+} > "$REPORT"
+
+# ---------- 产出 ----------
+mkdir -p "$OUTDIR"
+OUTDIR_ABS=$(CDPATH= cd -- "$OUTDIR" && pwd)
+if [ "$NO_TGZ" -eq 1 ]; then
+  rm -rf "$OUTDIR_ABS/$NAME"
+  cp -a "$WORK" "$OUTDIR_ABS/$NAME"
+  FINAL="$OUTDIR_ABS/$NAME"
+else
+  tar -C "$TMPROOT" -czf "$OUTDIR_ABS/$NAME.tar.gz" "$NAME"
+  FINAL="$OUTDIR_ABS/$NAME.tar.gz"
+fi
+
+# ---------- 打印报告 ----------
+cat "$REPORT"
+printf '\n输出: %s  (%s)\n' "$FINAL" "$(sz "$FINAL")"

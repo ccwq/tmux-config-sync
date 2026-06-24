@@ -1,0 +1,194 @@
+#!/bin/sh
+# tmux-restore — 从 tmux 懒人包恢复配置(备份既存 + 覆盖 + 重建软链 + 装命令)。
+#                纯 POSIX sh,Linux 发行版通用。新老 tmux 双兼容。
+#
+# 用法:
+#   tmux-restore [BUNDLE] [--bindir DIR] [--no-bin] [--dry-run] [--force] [-h]
+#     BUNDLE        包路径:.tar.gz / .tgz 或解开的目录(位置参数),默认当前目录
+#     --bindir DIR  把 tmux-pack/tmux-restore 命令装到哪,默认 ~/bin
+#     --no-bin      不安装命令
+#     --dry-run     只打印将执行的动作,不落盘
+#     --force       覆盖时不额外确认
+#     -h, --help    显示帮助
+#
+# 仅支持 Linux(假设 GNU coreutils)。新老 tmux 双兼容。
+# 无参数运行 = 显示本帮助。
+set -eu
+
+PROG=tmux-restore
+
+# ---------- 参数解析 ----------
+BUNDLE_IN=$PWD
+BINDIR="$HOME/bin"
+NOBIN=0
+DRYRUN=0
+FORCE=0
+
+usage() { sed -n '2,/^set -eu/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+[ $# -eq 0 ] && { usage; exit 0; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --bindir) BINDIR=${2:?--bindir 需要一个目录}; shift ;;
+    --bindir=*) BINDIR=${1#--bindir=} ;;
+    --no-bin) NOBIN=1 ;;
+    --dry-run) DRYRUN=1 ;;
+    --force) FORCE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) printf '%s: 未知参数: %s\n' "$PROG" "$1" >&2; exit 2 ;;
+    *) BUNDLE_IN=$1 ;;
+  esac
+  shift
+done
+
+die() { printf '%s: 错误: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: 警告: %s\n' "$PROG" "$*" >&2; }
+run() { if [ "$DRYRUN" -eq 1 ]; then printf '  [dry] %s\n' "$*"; else "$@"; fi; }
+
+# 目标机 tmux 前置检查:缺失或 <3.1 时大声警告,但不阻断还原。
+# (oh-my-tmux 需要 tmux 3.1+ 才读取 XDG 配置路径)
+check_tmux() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    warn "目标机未安装 tmux —— 配置已就位,但你需要先安装 tmux(建议 3.1+)再使用。"
+    return 0
+  fi
+  v=$(tmux -V 2>/dev/null || echo "")
+  num=$(printf '%s' "$v" | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+  if [ -z "$num" ]; then
+    warn "无法解析 tmux 版本(\"$v\"),请自行确认 >= 3.1。"
+    return 0
+  fi
+  maj=${num%.*}; min=${num#*.}
+  if [ "$maj" -lt 3 ] || { [ "$maj" -eq 3 ] && [ "$min" -lt 1 ]; }; then
+    warn "目标机 tmux 为 $v(<3.1):oh-my-tmux 需 3.1+ 才走 XDG 路径,配置已就位但可能不生效,建议升级 tmux。"
+  fi
+}
+
+# ---------- 能力探测 ----------
+command -v tar >/dev/null 2>&1 || die "缺少 tar"
+
+TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/tmuxrestore.XXXXXX")
+trap 'rm -rf "$TMPROOT"' EXIT INT TERM
+
+# ---------- 目标机布局(用本机环境,不用源机)----------
+: "${HOME:?HOME 未设置}"
+XDG_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}
+PLUGIN_ROOT=${TMUX_PLUGIN_MANAGER_PATH:-$HOME/.tmux/plugins}
+TS=$(date +%Y%m%d-%H%M%S)
+
+# ---------- 令牌展开(@TOKEN@ -> 目标机真实路径)----------
+expand() {
+  case "$1" in
+    @PLUGIN_ROOT@*) printf '%s%s' "$PLUGIN_ROOT" "${1#@PLUGIN_ROOT@}" ;;
+    @XDG_CONFIG@*) printf '%s%s' "$XDG_CONFIG" "${1#@XDG_CONFIG@}" ;;
+    @HOME@*) printf '%s%s' "$HOME" "${1#@HOME@}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ---------- 定位 bundle 目录(含 manifest)----------
+locate_bundle() {
+  b=$1
+  if [ -f "$b" ]; then
+    case "$b" in
+      *.tar.gz|*.tgz)
+        ex="$TMPROOT/extract"; mkdir -p "$ex"
+        tar -C "$ex" -xzf "$b" || die "解压失败: $b"
+        [ -f "$ex/manifest" ] && { printf '%s' "$ex"; return; }
+        for d in "$ex"/*/; do [ -f "${d}manifest" ] && { printf '%s' "${d%/}"; return; }; done
+        die "压缩包内未找到 manifest" ;;
+      *) die "无法识别的文件(需 .tar.gz/.tgz 或包目录): $b" ;;
+    esac
+  elif [ -d "$b" ]; then
+    [ -f "$b/manifest" ] && { printf '%s' "$b"; return; }
+    for d in "$b"/*/; do [ -f "${d}manifest" ] && { printf '%s' "${d%/}"; return; }; done
+    die "目录内未找到 manifest: $b"
+  else
+    die "找不到包: $b"
+  fi
+}
+
+BUNDLE=$(locate_bundle "$BUNDLE_IN")
+[ -f "$BUNDLE/manifest" ] || die "manifest 不存在"
+
+# ---------- 备份与恢复原语 ----------
+BACKED=""
+INSTALLED=""
+
+backup_if_exists() {
+  p=$1
+  if [ -e "$p" ] || [ -L "$p" ]; then
+    run mv -- "$p" "$p.bak-$TS"
+    BACKED="$BACKED
+  $p -> $p.bak-$TS"
+  fi
+}
+
+restore_dir() {   # $1 = payload 相对路径, $2 = 令牌化目标
+  src="$BUNDLE/$1"; dst=$(expand "$2")
+  [ -d "$src" ] || { warn "包内缺组件: $1"; return 0; }
+  backup_if_exists "$dst"
+  run mkdir -p -- "$(dirname "$dst")"
+  run cp -a -- "$src" "$dst"
+  INSTALLED="$INSTALLED
+  $dst"
+}
+
+restore_link() {  # $1 = 令牌化链接路径, $2 = 令牌化目标
+  link=$(expand "$1"); target=$(expand "$2")
+  backup_if_exists "$link"
+  run mkdir -p -- "$(dirname "$link")"
+  run ln -s -- "$target" "$link"
+  INSTALLED="$INSTALLED
+  $link -> $target"
+}
+
+# ---------- 两遍处理:先铺实体目录,再建软链 ----------
+TAB=$(printf '\t')
+SRC_TMUX=$(grep "^META${TAB}tmux_version" "$BUNDLE/manifest" 2>/dev/null | cut -f3 || echo "?")
+
+# 第一遍:DIR
+while IFS="$TAB" read -r f1 f2 f3 _rest; do
+  [ "$f1" = "DIR" ] && restore_dir "$f2" "$f3"
+done < "$BUNDLE/manifest"
+
+# 第二遍:LINK
+while IFS="$TAB" read -r f1 f2 f3 _rest; do
+  [ "$f1" = "LINK" ] && restore_link "$f2" "$f3"
+done < "$BUNDLE/manifest"
+
+# ---------- 安装命令到 bindir ----------
+BIN_NOTE=""
+if [ "$NOBIN" -eq 0 ]; then
+  run mkdir -p -- "$BINDIR"
+  for c in tmux-pack tmux-restore; do
+    if [ -f "$BUNDLE/$c" ]; then
+      run cp -- "$BUNDLE/$c" "$BINDIR/$c"
+      run chmod +x -- "$BINDIR/$c"
+      INSTALLED="$INSTALLED
+  $BINDIR/$c"
+    fi
+  done
+  case ":$PATH:" in
+    *":$BINDIR:"*) BIN_NOTE="" ;;
+    *) BIN_NOTE="注意: $BINDIR 不在 PATH,请加: export PATH=\"$BINDIR:\$PATH\"" ;;
+  esac
+fi
+
+# ---------- 报告 ----------
+printf 'tmux 配置已恢复%s\n' "$([ "$DRYRUN" -eq 1 ] && echo '(dry-run 预览)')"
+printf '=====================================\n'
+printf '目标: %s   $HOME=%s   tmux: %s\n' "$(hostname 2>/dev/null || echo host)" "$HOME" "$(tmux -V 2>/dev/null || echo 未安装)"
+printf '源机 tmux 版本: %s\n' "$SRC_TMUX"
+printf '\n备份(改名保留):%s\n' "${BACKED:-
+  (无)}"
+printf '\n已安装:%s\n' "${INSTALLED:-
+  (无)}"
+[ -n "$BIN_NOTE" ] && printf '\n%s\n' "$BIN_NOTE"
+
+# tmux 前置检查(警告走 stderr,不阻断)
+check_tmux
+
+printf '\n下一步: 启动 tmux 后按  prefix + r  重载;prefix + I  确认插件;prefix + Ctrl-s/Ctrl-r 存取会话\n'
