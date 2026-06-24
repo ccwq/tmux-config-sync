@@ -12,10 +12,10 @@
 
 ```sh
 # 1) 源机:打包当前 tmux 配置到当前目录
-curl -fsSL https://raw.githubusercontent.com/ccwq/tmux-config-sync/main/run.sh | sh -s -- pack .
+curl -fsSL https://raw.githubusercontent.com/ccwq/tmux-config-sync/master/run.sh | sh -s -- pack .
 
 # 2) 目标机:把产物拷过来,还原
-curl -fsSL https://raw.githubusercontent.com/ccwq/tmux-config-sync/main/run.sh | sh -s -- restore tmux-config-sync-*.tar.gz
+curl -fsSL https://raw.githubusercontent.com/ccwq/tmux-config-sync/master/run.sh | sh -s -- restore tmux-config-sync-*.tar.gz
 ```
 
 > `pack` 不带名字时,产物默认叫 `tmux-config-sync-<时间戳>.tar.gz`。
@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/ccwq/tmux-config-sync/main/run.sh |
 ### 想长期反复用?把命令装到 `~/bin`
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ccwq/tmux-config-sync/main/run.sh | sh -s -- --install
+curl -fsSL https://raw.githubusercontent.com/ccwq/tmux-config-sync/master/run.sh | sh -s -- --install
 # 装到别处:
 curl -fsSL .../run.sh | sh -s -- --install --bindir /usr/local/bin
 ```

@@ -26,7 +26,7 @@
 set -eu
 
 PROG=run.sh
-RAW_BASE=${TMUX_TOOLS_RAW_BASE:-https://raw.githubusercontent.com/ccwq/tmux-config-sync/main/tools}
+RAW_BASE=${TMUX_TOOLS_RAW_BASE:-https://raw.githubusercontent.com/ccwq/tmux-config-sync/master/tools}
 
 usage() { sed -n '2,/^set -eu/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 die()   { printf '%s: 错误: %s\n' "$PROG" "$*" >&2; exit 1; }
