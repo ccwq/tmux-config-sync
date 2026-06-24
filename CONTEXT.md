@@ -16,13 +16,18 @@
 
 `config-snapshots/` 下的纯配置备份(只有 `tmux.conf.local` 等,不含插件)。供"只想恢复个性化配置"的手动还原场景,与 bundle 区分开。
 
-## 安装器 (install.sh) —— 仓库级
+## 入口 (run.sh) —— 仓库级
 
-公开仓库根部的 `install.sh`,是 `curl | sh` 的拉取目标。职责:把 `tmux-pack`/`tmux-restore` 两个命令装到目标机的 `~/bin`(或 `--bindir`)。**与"还原某个 bundle"无关**。
+公开仓库根部的 `run.sh`,是 `curl | sh` 的拉取目标,也是本项目唯一对外入口(取代了原 `install.sh`)。三种用法:
+- `pack`/`restore`:**一把梭**——自动把 [工具](#工具-the-tools)拉到临时目录跑一次,**用完即删、零残留**;
+- `--install`:把 `tmux-pack`/`tmux-restore` 两个命令装到目标机的 `~/bin`(或 `--bindir`),供长期反复使用;
+- 仓库内 `./run.sh`:自动发现同目录 `tools/`,**离线**直跑,不联网。
+
+`pack`/`restore` 只是把参数透传给同名工具,**run.sh 本身与"还原某个 bundle"的逻辑无关**——那是 `tmux-restore` 的职责。
 
 ## bundle 内的还原脚本 (restore.sh)
 
-`tmux-pack` 生成在 bundle 里的一键还原脚本,职责是**还原这一个 bundle**(转发给 `tmux-restore`)。为避免与仓库级[安装器](#安装器-installsh--仓库级)同名混淆,从原 `install.sh` 改名为 `restore.sh`。
+`tmux-pack` 生成在 bundle 里的一键还原脚本,职责是**还原这一个 bundle**(转发给 `tmux-restore`)。它生在 bundle 内、只管自己这一个包,与仓库级[入口](#入口-runsh--仓库级)无关。
 
 ## 源机 / 目标机
 
