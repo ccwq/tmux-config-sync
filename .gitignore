@@ -1,0 +1,6 @@
+# 本机/个人产物 —— 不进公开仓库
+bundles/
+config-snapshots/
+本机笔记.md
+*.bak-*
+*.tar.gz
